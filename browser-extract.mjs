@@ -137,6 +137,105 @@ export function workdayCxsUrl(rawUrl) {
   return ats && ats.ats === 'workday' ? ats.apiUrl : null;
 }
 
+// ── iCIMS ─────────────────────────────────────────────────────────────
+// iCIMS exposes no public JD API, but its posting HTML is split in two. The
+// bare `/jobs/{id}/job` URL answers with a ~700-byte cookie shell ("Please
+// Enable Cookies to Continue") that carries no JD at all — which is what BOTH a
+// plain HTTP fetch and a headless Chromium see, because the body is injected
+// afterwards by the portal's own JS. The same posting re-served with
+// `in_iframe=1` is the server-rendered document the portal loads into its
+// iframe, and it carries Posted Date, Job ID, Job Locations and the full body.
+//
+// So the fix is a URL rewrite, not a browser: a Playwright read of the bare
+// posting URL cannot succeed no matter how long it waits, and a caller that
+// falls through to one burns a browser launch to learn nothing. Observed on
+// Nortal's board (careers-en-nortal.icims.com), 2026-10.
+const ICIMS_HOST_RE = /(^|\.)icims\.com$/i;
+// `/jobs/{id}/job` or `/jobs/{id}/{title-slug}/job` — iCIMS includes a slug on
+// most live postings, so requiring the bare form dropped every real URL.
+const ICIMS_JOB_RE = /^\/jobs\/(\d+)(?:\/[^/]+)?\/job\/?$/i;
+// Last line of the portal chrome (cookie notice → "Returning Candidate?" →
+// sign-in link) that precedes the posting body.
+const ICIMS_CHROME_END = 'Log back in!';
+
+/**
+ * Map an iCIMS posting URL to the `in_iframe=1` variant that server-renders the
+ * JD, or null for any other URL. Pure — exported for tests.
+ * @param {string} rawUrl
+ * @returns {string|null}
+ */
+export function icimsIframeUrl(rawUrl) {
+  let u;
+  try {
+    u = new URL(String(rawUrl ?? ''));
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'https:') return null;
+  if (!ICIMS_HOST_RE.test(u.hostname)) return null;
+  if (!ICIMS_JOB_RE.test(u.pathname)) return null;
+  u.searchParams.set('in_iframe', '1');
+  return u.href;
+}
+
+/**
+ * Drop the iCIMS portal chrome that precedes the posting body. Everything from
+ * the sign-in link onward is the posting itself (title, Posted Date, Job ID,
+ * Job Locations, Overview, …). Pure — exported for tests.
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripIcimsChrome(text) {
+  const s = String(text ?? '');
+  const i = s.lastIndexOf(ICIMS_CHROME_END);
+  return (i === -1 ? s : s.slice(i + ICIMS_CHROME_END.length)).trim();
+}
+
+/**
+ * Title for an iCIMS posting, taken from the body's own first line rather than
+ * the `<title>` tag: the tag is HTML-entity-encoded ("Data &amp; AI Engineer")
+ * and the body line is already decoded by jdHtmlToText. Trailing
+ * "| Careers at <country>" and a dangling "in" (the city is absent when the req
+ * covers several countries) are removed.
+ * @param {string} text - already stripped body text
+ * @returns {string}
+ */
+function icimsTitleFromText(text) {
+  const first = String(text ?? '').split('\n')[0]?.trim() ?? '';
+  return first
+    .replace(/\s*\|\s*Careers at .*$/i, '')
+    .replace(/\s+in$/i, '')
+    .trim();
+}
+
+/**
+ * Read an iCIMS JD from its `in_iframe=1` variant. Same contract as the other
+ * fetchers: null means "not readable here", and the caller keeps its existing
+ * fallback behaviour.
+ */
+async function fetchIcimsJd(iframeUrl, postingUrl, textCap, timeoutMs) {
+  if (rejectPrivateOrInvalid(iframeUrl)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(iframeUrl, {
+      headers: { accept: 'text/html,application/xhtml+xml', 'user-agent': DEFAULT_USER_AGENT },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const text = compactText(stripIcimsChrome(jdHtmlToText(await res.text())), textCap);
+    // Under the shared floor the iframe answered with chrome only — treat it as
+    // unreadable rather than shipping a shell as if it were a JD.
+    if (text.length < MIN_JD_TEXT_CHARS) return null;
+    return { url: postingUrl, title: compactText(icimsTitleFromText(text), 300), text };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Tags whose CLOSE ends a block, so it becomes a line break. `li` is absent on
 // purpose: its OPEN tag already emits the break plus a bullet below, and
 // breaking on both ends double-spaces every list.
@@ -561,6 +660,17 @@ export const JD_FETCHERS = {
  *   caller should fall through to a browser-backed read.
  */
 export async function fetchJdViaKnownApi(url, textCap = JD_TEXT_CAP, timeoutMs = WORKDAY_TIMEOUT_MS) {
+  // iCIMS runs BEFORE the resolveAtsApi gate on purpose: it is not an
+  // ATS_PROVIDERS entry (no JSON endpoint), so the gate would return null and
+  // the caller would fall through to Playwright — which cannot read the bare
+  // posting URL (see the iCIMS block above). A null here still falls through, so
+  // an unreadable iframe keeps the old behaviour instead of regressing it.
+  const iframeUrl = icimsIframeUrl(url);
+  if (iframeUrl) {
+    const icims = await fetchIcimsJd(iframeUrl, url, textCap, timeoutMs);
+    if (icims) return { ...icims, ats: 'icims' };
+  }
+
   const resolved = resolveAtsApi(url);
   if (!resolved || !JD_TEXT_API_ATS.has(resolved.ats)) return null;
   const fetcher = JD_FETCHERS[resolved.ats];
